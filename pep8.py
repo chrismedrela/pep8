@@ -233,7 +233,7 @@ def maximum_line_length(physical_line, max_line_length):
 
 
 def blank_lines(logical_line, blank_lines, indent_level, line_number,
-                previous_logical, previous_indent_level):
+                previous_logical, previous_indent_level, next_physical):
     r"""
     Separate top-level function and class definitions with two blank lines.
 
@@ -247,6 +247,8 @@ def blank_lines(logical_line, blank_lines, indent_level, line_number,
 
     Okay: def a():\n    pass\n\n\ndef b():\n    pass
     Okay: def a():\n    pass\n\n\n# Foo\n# Bar\n\ndef b():\n    pass
+    Okay: def a(): pass\ndef b(): pass
+    Okay: class Foo(object): pass\nclass Bar(object): pass
 
     E301: class Foo:\n    b = 0\n    def bar():\n        pass
     E302: def a():\n    pass\n\ndef b(n):\n    pass
@@ -262,12 +264,15 @@ def blank_lines(logical_line, blank_lines, indent_level, line_number,
     elif blank_lines > 2 or (indent_level and blank_lines == 2):
         yield 0, "E303 too many blank lines (%d)" % blank_lines
     elif logical_line.startswith(('def ', 'class ', '@')):
-        if indent_level:
-            if not (blank_lines or previous_indent_level < indent_level or
-                    DOCSTRING_REGEX.match(previous_logical)):
-                yield 0, "E301 expected 1 blank line, found 0"
-        elif blank_lines != 2:
-            yield 0, "E302 expected 2 blank lines, found %d" % blank_lines
+        if (logical_line.startswith('@') or
+                not is_bunch_of_definitions(previous_logical, logical_line,
+                                            next_physical)):
+            if indent_level:
+                if not (blank_lines or previous_indent_level < indent_level or
+                        DOCSTRING_REGEX.match(previous_logical)):
+                    yield 0, "E301 expected 1 blank line, found 0"
+            elif blank_lines != 2:
+                yield 0, "E302 expected 2 blank lines, found %d" % blank_lines
 
 
 def extraneous_whitespace(logical_line):
@@ -817,7 +822,7 @@ def imports_on_separate_lines(logical_line):
             yield found, "E401 multiple imports on one line"
 
 
-def compound_statements(logical_line):
+def compound_statements(logical_line, previous_logical, next_physical):
     r"""
     Compound statements (multiple statements on the same line) are
     generally discouraged.
@@ -826,10 +831,15 @@ def compound_statements(logical_line):
     on the same line, never do this for multi-clause statements. Also
     avoid folding such long lines!
 
+    Note that a bunch of dummy class/def one-liners is allowed and doesn't
+    result in an error.
+
     Okay: if foo == 'blah':\n    do_blah_thing()
     Okay: do_one()
     Okay: do_two()
     Okay: do_three()
+    Okay: class Foo(object): pass\nclass Bar(object): pass
+    Okay: def foo(): pass\ndef bar(): pass
 
     E701: if foo == 'blah': do_blah_thing()
     E701: for x in lst: total += x
@@ -839,21 +849,28 @@ def compound_statements(logical_line):
     E701: try: something()
     E701: finally: cleanup()
     E701: if foo == 'blah': one(); two(); three()
+    E701: class Foo(object): pass
+    E701: def foo(): pass
 
     E702: do_one(); do_two(); do_three()
     E703: do_four();  # useless semicolon
     """
+
     line = logical_line
+    next_physical = next_physical.strip()
     last_char = len(line) - 1
-    found = line.find(':')
-    while -1 < found < last_char:
-        before = line[:found]
-        if (before.count('{') <= before.count('}') and  # {'a': 1} (dict)
-            before.count('[') <= before.count(']') and  # [1:2] (slice)
-            before.count('(') <= before.count(')') and  # (Python 3 annotation)
-                not LAMBDA_REGEX.search(before)):       # lambda x: x
-            yield found, "E701 multiple statements on one line (colon)"
-        found = line.find(':', found + 1)
+
+    if not is_bunch_of_definitions(previous_logical, line, next_physical):
+        found = line.find(':')
+        while -1 < found < last_char:
+            before = line[:found]
+            if (before.count('{') <= before.count('}') and  # {'a': 1} (dict)
+                before.count('[') <= before.count(']') and  # [1:2] (slice)
+                before.count('(') <= before.count(')') and  # (annotations)
+                    not LAMBDA_REGEX.search(before)):       # lambda x: x
+                yield found, "E701 multiple statements on one line (colon)"
+            found = line.find(':', found + 1)
+
     found = line.find(';')
     while -1 < found:
         if found < last_char:
@@ -1133,6 +1150,26 @@ def filename_match(filename, patterns, default=True):
 
 
 ##############################################################################
+# Helpers
+##############################################################################
+
+def is_bunch_of_definitions(previous_line, current_line, next_line):
+    """ Check if this is a class/def definition living in a bunch of other
+    class/def definitions. """
+
+    previous_line = previous_line.strip()
+    current_line = current_line.strip()
+    next_line = next_line.strip()
+
+    def surrounded_by(obj):
+        return (previous_line.startswith(obj) or
+                next_line.startswith(obj))
+
+    return (current_line.startswith('class') and surrounded_by('class') or
+            current_line.startswith('def') and surrounded_by('def'))
+
+
+##############################################################################
 # Framework to run all checks
 ##############################################################################
 
@@ -1314,11 +1351,15 @@ class Checker(object):
         Build a line from tokens and run all logical checks on it.
         """
         self.build_tokens_line()
-        self.report.increment_logical_line()
         first_line = self.lines[self.mapping[0][1][2][0] - 1]
+        try:
+            self.next_physical = self.lines[self.mapping[-1][1][2][0]]
+        except IndexError:  # this is last line and there is no next line
+            self.next_physical = ''
         indent = first_line[:self.mapping[0][1][2][1]]
         self.previous_indent_level = self.indent_level
         self.indent_level = expand_indent(indent)
+
         if self.verbose >= 2:
             print(self.logical_line[:80].rstrip())
         for name, check, argument_names in self._logical_checks:
@@ -1390,6 +1431,7 @@ class Checker(object):
                 if token_type == tokenize.NEWLINE:
                     if self.blank_lines < blank_lines_before_comment:
                         self.blank_lines = blank_lines_before_comment
+
                     self.check_logical()
                     self.tokens = []
                     self.blank_lines = blank_lines_before_comment = 0
@@ -1405,6 +1447,7 @@ class Checker(object):
                     if COMMENT_WITH_NL:
                         # The comment also ends a physical line
                         self.tokens = []
+
         return self.report.get_file_results()
 
 
